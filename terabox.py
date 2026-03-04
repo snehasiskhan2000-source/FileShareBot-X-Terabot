@@ -64,9 +64,8 @@ async def process_terabox_link(client, message):
     raw_text = message.text
     text = raw_text.lower()
     
-    # --- THE FIX: Expanded Terabox Domain Whitelist ---
     valid_domains = [
-        "terabox", "1024tera", "terashare", "4funbox", 
+        "terabox", "1024tera", "1024terabox", "terashare", "4funbox", 
         "mirrobox", "nephobox", "freeterabox", "momerybox", "teraboxapp"
     ]
     
@@ -78,7 +77,8 @@ async def process_terabox_link(client, message):
 
     await safe_delete(message)
     
-    url_match = re.search(r"https?://[^\s]+", raw_text)
+    # FIX 1: Ignore case so "Https://" works perfectly
+    url_match = re.search(r"https?://[^\s]+", raw_text, re.IGNORECASE)
     if not url_match:
         err = await message.reply_text("<blockquote>❌ <b>Extraction Failed.</b> No valid URL detected.</blockquote>")
         asyncio.create_task(delete_after(client, err.chat.id, err.id, TEMP_MSG_DELETE_TIME))
@@ -173,7 +173,12 @@ async def process_terabox_link(client, message):
     thumb_path = f"downloads/thumb_{secrets.token_hex(4)}.jpg" if thumb_url else None
     
     try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
+        # FIX 2: Added User-Agent headers to prevent Terabox from sending a 403 block page
+        dl_headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        }
+        
+        async with aiohttp.ClientSession(timeout=timeout, headers=dl_headers) as session:
             if thumb_url:
                 async with session.get(thumb_url) as t_resp:
                     if t_resp.status == 200:
@@ -181,6 +186,14 @@ async def process_terabox_link(client, message):
                             await f.write(await t_resp.read())
             
             async with session.get(video_url) as resp:
+                # FIX 3: Check to ensure we aren't downloading an error page
+                if resp.status != 200:
+                    raise Exception(f"HTTP {resp.status}: Download blocked by Terabox.")
+                
+                content_type = resp.headers.get('Content-Type', '')
+                if 'text/html' in content_type:
+                    raise Exception("Terabox returned a webpage instead of a video.")
+
                 async with aiofiles.open(local_filename, mode='wb') as f:
                     while True:
                         chunk = await resp.content.read(2 * 1024 * 1024) 
