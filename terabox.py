@@ -30,7 +30,7 @@ app = Client(
     parse_mode=enums.ParseMode.HTML
 )
 
-# --- THE FIX: Dictionary to track and delete welcome messages ---
+# --- Dictionary to track and delete welcome messages ---
 active_welcome_msgs = {}
 
 # ================= Database Setup =================
@@ -70,7 +70,7 @@ async def process_terabox_link(client, message):
     raw_text = message.text
     text = raw_text.lower()
     
-    # --- THE FIX: Clean up the old welcome message immediately ---
+    # --- Clean up the old welcome message immediately ---
     if chat_id in active_welcome_msgs:
         try:
             await client.delete_messages(chat_id, active_welcome_msgs[chat_id])
@@ -192,10 +192,15 @@ async def process_terabox_link(client, message):
     thumb_path = f"downloads/thumb_{secrets.token_hex(4)}.jpg" if thumb_url else None
     
     try:
-        # Added extra Accept headers to trick strict servers
+        # --- THE FIX: Ultimate Stealth Headers ---
         dl_headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.1024tera.com/",  
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "cross-site"
         }
         
         async with aiohttp.ClientSession(timeout=timeout, headers=dl_headers) as session:
@@ -219,10 +224,10 @@ async def process_terabox_link(client, message):
                         if not chunk: break
                         await f.write(chunk)
                         
-        # --- THE FIX: Physical File Verification ---
+        # --- Physical File Verification ---
         if os.path.exists(local_filename):
             file_size_bytes = os.path.getsize(local_filename)
-            # If the downloaded file is less than 100KB, it is a fake/error file
+            print(f"Downloaded file size: {file_size_bytes / 1024:.2f} KB") # For your console tracking
             if file_size_bytes < 100 * 1024:
                 raise Exception("Terabox API provided an expired or restricted file link.")
                 
@@ -284,8 +289,6 @@ async def process_terabox_link(client, message):
             caption=user_caption, 
             reply_markup=keyboard
         )
-        # Ensure the bot tracks this new "Download More" button prompt if we need to auto-delete it later
-        active_welcome_msgs[message.chat.id] = sent_vid.id
         
         asyncio.create_task(delete_after(client, message.chat.id, sent_vid.id, FILE_DELETE_TIME))
 
