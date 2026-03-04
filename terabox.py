@@ -125,7 +125,15 @@ async def process_terabox_link(client, message):
     # ==================================================================
 
     await client.send_chat_action(message.chat.id, enums.ChatAction.TYPING)
-    anim_msg = await message.reply_text("<blockquote><code>[📡] Pinging servers...</code></blockquote>")
+    
+    # --- Crystal Clean Animation Sequence ---
+    anim_msg = await message.reply_text("<blockquote>✨ <b>Transmitting Link</b> 🙌\n<i>Ready for payload.</i></blockquote>")
+    await asyncio.sleep(0.4)
+    await anim_msg.edit_text("<blockquote>✨ <b>Transmitting Link</b> 🙌\n<i>Ready for payload..</i></blockquote>")
+    await asyncio.sleep(0.4)
+    await anim_msg.edit_text("<blockquote>✨ <b>Transmitting Link</b> 🙌\n<i>Ready for payload...</i></blockquote>")
+    await asyncio.sleep(0.4)
+    await anim_msg.edit_text("<blockquote><code>[📡] Pinging servers...</code></blockquote>")
 
     api_url = 'https://xapiverse.com/api/terabox-pro'
     headers = {'Content-Type': 'application/json', 'xAPIverse-Key': XAPI_KEY}
@@ -263,4 +271,4 @@ async def process_terabox_link(client, message):
 if __name__ == "__main__":
     print("Starting Terabox Bot...")
     app.run()
-        
+    
