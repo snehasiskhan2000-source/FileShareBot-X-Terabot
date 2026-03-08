@@ -189,7 +189,7 @@ async def cmd_download(client, message):
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
         }
         async with aiohttp.ClientSession(timeout=timeout, headers=dl_headers) as session:
-            async with session.get(url) as resp:
+            async with session.get(url, allow_redirects=True) as resp:
                 if resp.status != 200:
                     raise Exception(f"HTTP {resp.status} - Access Denied by remote server.")
                 
@@ -212,7 +212,7 @@ async def cmd_download(client, message):
                 filename = urllib.parse.unquote(filename)
                 filename = filename.split('?')[0]
                 
-                # 4. Determine extension without faking it
+                # 4. Strict Video Enforcement (Force .mp4 & Dimensions)
                 if '.' in filename:
                     base_name, file_ext = filename.rsplit('.', 1)
                     file_ext = file_ext.lower()
@@ -222,7 +222,8 @@ async def cmd_download(client, message):
                 is_video_content = 'video/' in content_type.lower()
                 video_extensions = ['mp4', 'mkv', 'webm', 'avi', 'mov', 'flv', 'mpg', 'mpeg', 'ts', 'm4v']
                 
-                if is_video_content and not file_ext:
+                # If it's a video, forcefully rename it to .mp4 so Telegram stops complaining
+                if is_video_content or file_ext in video_extensions:
                     filename = f"{base_name}.mp4"
                     file_ext = "mp4"
                 elif not file_ext:
@@ -237,9 +238,15 @@ async def cmd_download(client, message):
                         if not chunk: break
                         await f.write(chunk)
                         
+                # --- THE 0-BYTE TRAP ---
+                if os.path.getsize(local_filename) == 0:
+                    raise Exception("Remote server returned 0 Bytes. The direct link has expired or blocked the download!")
+                        
     except Exception as e:
         await anim_msg.edit_text(f"<blockquote>❌ <b>Download Failed:</b>\n<code>{e}</code></blockquote>")
         asyncio.create_task(delete_after(client, anim_msg.chat.id, anim_msg.id, TEMP_MSG_DELETE_TIME))
+        if local_filename and os.path.exists(local_filename): 
+            os.remove(local_filename)
         return
 
     # Upload Phase
@@ -252,9 +259,8 @@ async def cmd_download(client, message):
     channel_caption = f"<blockquote>🔗 <b>Secure Access Link:</b>\n<code>{share_link}</code></blockquote>"
 
     try:
-        if is_video_content or file_ext in video_extensions:
+        if file_ext == "mp4":
             await client.send_chat_action(message.chat.id, enums.ChatAction.UPLOAD_VIDEO)
-            # --- THE MAGIC TRICK: FORCING DIMENSIONS ---
             saved_msg = await client.send_video(
                 chat_id=CHANNEL_ID, 
                 video=local_filename, 
@@ -422,4 +428,4 @@ async def main():
 
 if __name__ == "__main__":
     app.run(main())
-                
+            
