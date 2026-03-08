@@ -3,6 +3,10 @@ import asyncio
 import logging
 import sqlite3
 import secrets
+import aiohttp
+import aiofiles
+import re
+import urllib.parse
 from aiohttp import web
 from pyrogram import Client, filters, enums
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -103,7 +107,6 @@ async def cmd_start(client, message):
         
         if results:
             await client.send_chat_action(message.chat.id, enums.ChatAction.TYPING)
-            # PREMIUM EXTRACT ANIMATION
             anim_msg = await message.reply_text("<blockquote><code>[🔍] Querying secure vault...</code></blockquote>")
             await asyncio.sleep(0.5)
             await anim_msg.edit_text("<blockquote><code>[🔐] Validating access token...</code></blockquote>")
@@ -155,8 +158,118 @@ async def cmd_admin(client, message):
     ])
     await message.reply_text("<blockquote>⚙️ <b>Admin Root Access</b>\nSelect an override command:</blockquote>", reply_markup=keyboard)
 
+# ================= NEW: Direct URL Download Logic =================
+@app.on_message(filters.command("download") & filters.private)
+async def cmd_download(client, message):
+    await safe_delete(message)
+    if message.from_user.id != ADMIN_ID: return 
+
+    args = message.command
+    if len(args) < 2:
+        err = await message.reply_text("<blockquote>⚠️ <b>Syntax Error:</b>\nUsage: <code>/download &lt;Direct_Download_Link&gt;</code></blockquote>")
+        asyncio.create_task(delete_after(client, err.chat.id, err.id, TEMP_MSG_DELETE_TIME))
+        return
+
+    url = args[1]
+    
+    # Simple validation to check if it's a URL
+    if not re.match(r'^https?://', url):
+        err = await message.reply_text("<blockquote>❌ <b>Invalid URL:</b>\nPlease provide a valid HTTP/HTTPS direct link.</blockquote>")
+        asyncio.create_task(delete_after(client, err.chat.id, err.id, TEMP_MSG_DELETE_TIME))
+        return
+
+    anim_msg = await message.reply_text("<blockquote><code>[📥] Downloading...</code></blockquote>")
+    await client.send_chat_action(message.chat.id, enums.ChatAction.TYPING)
+
+    # 1. Download Phase
+    os.makedirs("downloads", exist_ok=True)
+    
+    # Try to extract a filename from the URL, or use a default
+    parsed_url = urllib.parse.urlparse(url)
+    filename = os.path.basename(parsed_url.path)
+    if not filename or "." not in filename:
+        filename = "downloaded_file.bin"
+        
+    local_filename = f"downloads/{secrets.token_hex(4)}_{filename}"
+    timeout = aiohttp.ClientTimeout(total=3600)
+
+    try:
+        dl_headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        }
+        async with aiohttp.ClientSession(timeout=timeout, headers=dl_headers) as session:
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    raise Exception(f"HTTP {resp.status} - Access Denied by remote server.")
+                
+                # Try to get the real filename from headers if the server provides it
+                cd = resp.headers.get('Content-Disposition')
+                if cd and 'filename=' in cd:
+                    header_filename = re.findall("filename=(.+)", cd)
+                    if header_filename:
+                        filename = header_filename[0].strip('\"\'')
+                        # Update local path with real extension
+                        local_filename = f"downloads/{secrets.token_hex(4)}_{filename}"
+
+                async with aiofiles.open(local_filename, mode='wb') as f:
+                    while True:
+                        chunk = await resp.content.read(2 * 1024 * 1024) 
+                        if not chunk: break
+                        await f.write(chunk)
+    except Exception as e:
+        await anim_msg.edit_text(f"<blockquote>❌ <b>Download Failed:</b>\n<code>{e}</code></blockquote>")
+        asyncio.create_task(delete_after(client, anim_msg.chat.id, anim_msg.id, TEMP_MSG_DELETE_TIME))
+        return
+
+    # 2. Upload Phase
+    await anim_msg.edit_text("<blockquote><code>[📤] Uploading...</code></blockquote>")
+    await client.send_chat_action(message.chat.id, enums.ChatAction.UPLOAD_DOCUMENT)
+
+    link_id = secrets.token_urlsafe(8)
+    bot_info = await client.get_me()
+    share_link = f"https://t.me/{bot_info.username}?start={link_id}"
+    
+    channel_caption = f"<blockquote>🔗 <b>Secure Access Link:</b>\n<code>{share_link}</code></blockquote>"
+    file_ext = filename.split('.')[-1].lower() if '.' in filename else 'bin'
+    video_extensions = ['mp4', 'mkv', 'webm', 'avi', 'mov', 'flv']
+
+    try:
+        if file_ext in video_extensions:
+            saved_msg = await client.send_video(
+                chat_id=CHANNEL_ID, 
+                video=local_filename, 
+                caption=channel_caption, 
+                has_spoiler=True,
+                file_name=filename,
+                supports_streaming=True
+            )
+        else:
+            saved_msg = await client.send_document(
+                chat_id=CHANNEL_ID, 
+                document=local_filename, 
+                caption=channel_caption, 
+                file_name=filename
+            )
+            
+        cursor.execute('INSERT INTO shared_files (link_id, message_id) VALUES (?, ?)', (link_id, saved_msg.id))
+        conn.commit()
+
+        success_text = (
+            "<blockquote>✅ <b>Download & Upload Complete!</b>\n"
+            "📦 <i>Secured under a single encrypted link.</i></blockquote>\n"
+            "🔗 <b>Shareable Link:</b>\n"
+            f"<code>{share_link}</code>"
+        )
+        await anim_msg.edit_text(success_text)
+        
+    except Exception as e:
+        await anim_msg.edit_text(f"<blockquote>❌ <b>Upload Error:</b>\n<code>{e}</code></blockquote>")
+    finally:
+        if os.path.exists(local_filename): 
+            os.remove(local_filename)
+
 # ================= Hidden Upload Logic =================
-@app.on_message(upload_filter & filters.text & ~filters.command(["start", "upload", "cancel", "admin"]) & filters.private)
+@app.on_message(upload_filter & filters.text & ~filters.command(["start", "upload", "cancel", "admin", "download"]) & filters.private)
 async def process_upload_text(client, message):
     if message.from_user.id != ADMIN_ID: return
     await safe_delete(message)
@@ -189,7 +302,6 @@ async def process_upload_media(client, message):
 
     if is_first:
         await client.send_chat_action(message.chat.id, enums.ChatAction.UPLOAD_DOCUMENT)
-        # PREMIUM UPLOAD ANIMATION
         anim_msg = await message.reply_text("<blockquote><code>[⚡] Initializing secure uplink...</code>\n<code>[██░░░░░░░░] 20%</code></blockquote>")
         await track_msg(message.from_user.id, anim_msg.id)
         await asyncio.sleep(0.4)
@@ -287,4 +399,4 @@ async def main():
 
 if __name__ == "__main__":
     app.run(main())
-        
+    
