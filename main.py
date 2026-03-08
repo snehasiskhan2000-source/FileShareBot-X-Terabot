@@ -7,6 +7,7 @@ import aiohttp
 import aiofiles
 import re
 import urllib.parse
+import json
 from aiohttp import web
 from pyrogram import Client, filters, enums
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -77,6 +78,33 @@ async def auto_delete_batch_task(client: Client, chat_id: int, message_ids: list
     await asyncio.sleep(AUTO_DELETE_TIME)
     try: await client.delete_messages(chat_id, message_ids)
     except Exception as e: logging.error(f"Could not auto-delete: {e}")
+
+# --- FFMPEG MAGIC UTILS ---
+async def get_video_info(file_path):
+    try:
+        cmd = ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", file_path]
+        process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        stdout, _ = await process.communicate()
+        data = json.loads(stdout)
+        video_stream = next((s for s in data["streams"] if s["codec_type"] == "video"), None)
+        width = int(video_stream["width"]) if video_stream else 1280
+        height = int(video_stream["height"]) if video_stream else 720
+        duration = int(float(data["format"]["duration"]))
+        return width, height, duration
+    except Exception:
+        return 1280, 720, 0
+
+async def get_thumbnail(file_path):
+    try:
+        thumb_path = f"{file_path}_thumb.jpg"
+        # Extract a frame at the 2-second mark to use as the physical thumbnail
+        cmd = ["ffmpeg", "-i", file_path, "-ss", "00:00:02.000", "-vframes", "1", thumb_path, "-y"]
+        process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        await process.communicate()
+        if os.path.exists(thumb_path):
+            return thumb_path
+    except Exception: pass
+    return None
 
 # ================= Custom Filters =================
 async def is_upload_state(_, __, message): return user_states.get(message.from_user.id) == "upload"
@@ -160,7 +188,7 @@ async def cmd_admin(client, message):
     ])
     await message.reply_text("<blockquote>⚙️ <b>Admin Root Access</b>\nSelect an override command:</blockquote>", reply_markup=keyboard)
 
-# ================= NEW: Interactive Download Flow =================
+# ================= Interactive Download Flow =================
 @app.on_message(filters.command("download") & filters.private)
 async def cmd_download(client, message):
     await safe_delete(message)
@@ -190,6 +218,7 @@ async def process_download_link(client, message):
     os.makedirs("downloads", exist_ok=True)
     timeout = aiohttp.ClientTimeout(total=3600)
     local_filename = None
+    thumb_path = None
 
     try:
         dl_headers = {
@@ -223,7 +252,6 @@ async def process_download_link(client, message):
                 is_video_content = 'video/' in content_type.lower()
                 video_extensions = ['mp4', 'mkv', 'webm', 'avi', 'mov', 'flv', 'mpg', 'mpeg', 'ts', 'm4v']
                 
-                # Enforce .mp4 to give it the highest chance of showing as a video
                 if is_video_content or file_ext in video_extensions:
                     filename = f"{base_name}.mp4"
                     file_ext = "mp4"
@@ -249,7 +277,7 @@ async def process_download_link(client, message):
         return
 
     # Upload Phase
-    await anim_msg.edit_text("<blockquote><code>[📤] Uploading...</code></blockquote>")
+    await anim_msg.edit_text("<blockquote><code>[⚙️] Processing Media Engine...</code></blockquote>")
 
     link_id = secrets.token_urlsafe(8)
     bot_info = await client.get_me()
@@ -259,18 +287,27 @@ async def process_download_link(client, message):
     try:
         if file_ext == "mp4":
             await client.send_chat_action(message.chat.id, enums.ChatAction.UPLOAD_VIDEO)
+            await anim_msg.edit_text("<blockquote><code>[📤] Uploading Video...</code></blockquote>")
+            
+            # THE FFmpeg NUCLEAR OPTION: Extract exact dimensions, duration, and a physical thumbnail
+            width, height, duration = await get_video_info(local_filename)
+            thumb_path = await get_thumbnail(local_filename)
+
             saved_msg = await client.send_video(
                 chat_id=CHANNEL_ID, 
                 video=local_filename, 
                 caption=channel_caption, 
                 has_spoiler=True,
                 file_name=filename,
-                width=1280,   
-                height=720,   
+                width=width,   
+                height=height,
+                duration=duration,
+                thumb=thumb_path if thumb_path and os.path.exists(thumb_path) else None,
                 supports_streaming=True
             )
         else:
             await client.send_chat_action(message.chat.id, enums.ChatAction.UPLOAD_DOCUMENT)
+            await anim_msg.edit_text("<blockquote><code>[📤] Uploading Document...</code></blockquote>")
             saved_msg = await client.send_document(
                 chat_id=CHANNEL_ID, 
                 document=local_filename, 
@@ -293,6 +330,7 @@ async def process_download_link(client, message):
         await anim_msg.edit_text(f"<blockquote>❌ <b>Upload Error:</b>\n<code>{e}</code></blockquote>")
     finally:
         if local_filename and os.path.exists(local_filename): os.remove(local_filename)
+        if thumb_path and os.path.exists(thumb_path): os.remove(thumb_path)
 
 # ================= Hidden Upload Logic =================
 @app.on_message(upload_filter & filters.text & ~filters.command(["start", "upload", "cancel", "admin", "download"]) & filters.private)
@@ -425,4 +463,3 @@ async def main():
 
 if __name__ == "__main__":
     app.run(main())
-    
