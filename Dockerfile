@@ -1,18 +1,25 @@
-# Use a lightweight Python image
+# Use a standard, lightweight Python image
 FROM python:3.10-slim
 
-# Install FFmpeg (The Media Engine)
+# Install FFmpeg for video processing
 RUN apt-get update && apt-get install -y ffmpeg
 
-# Set up the working directory
 WORKDIR /app
 
-# Copy your files into the server
-COPY . .
+# Copy requirements first
+COPY requirements.txt .
 
-# Install your Python requirements
+# Install your Python packages 
 RUN pip install --no-cache-dir -r requirements.txt
 
-# --- THE FIX: Staggered Boot ---
-# Starts FileShareBot, waits 3 seconds so the database is safely created, THEN starts TeraboxBot.
+# Download the exact browser version for network sniffing
+RUN playwright install chromium
+
+# Install the necessary system dependencies for the browser
+RUN playwright install-deps
+
+# Copy your bot code
+COPY . .
+
+# Starts FileShareBot, waits 3 seconds, THEN starts TeraboxBot.
 CMD bash -c "python main.py & sleep 3 && python terabox.py"
