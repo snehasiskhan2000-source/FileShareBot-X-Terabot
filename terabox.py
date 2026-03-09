@@ -6,6 +6,7 @@ import secrets
 import aiohttp
 import aiofiles
 import re
+import json
 from pyrogram import Client, filters, enums
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
@@ -24,6 +25,7 @@ logging.basicConfig(level=logging.INFO)
 
 app = Client(
     "terabox_bot",
+    in_memory=True,  # <-- 100% prevents SQLite lock conflicts with main.py
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=TERABOX_BOT_TOKEN,
@@ -40,7 +42,7 @@ cursor.execute('CREATE TABLE IF NOT EXISTS shared_files (link_id TEXT, message_i
 cursor.execute('CREATE TABLE IF NOT EXISTS terabox_cache (terabox_url TEXT PRIMARY KEY, message_id INTEGER)')
 conn.commit()
 
-# ================= Utility Functions =================
+# ================= Utility & FFmpeg Functions =================
 async def safe_delete(message):
     try: await message.delete()
     except Exception: pass
@@ -50,18 +52,43 @@ async def delete_after(client, chat_id, message_id, delay):
     try: await client.delete_messages(chat_id, message_id)
     except Exception: pass
 
+async def get_video_info(file_path):
+    try:
+        cmd = ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", file_path]
+        process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        stdout, _ = await process.communicate()
+        data = json.loads(stdout)
+        video_stream = next((s for s in data["streams"] if s["codec_type"] == "video"), None)
+        width = int(video_stream["width"]) if video_stream else 1280
+        height = int(video_stream["height"]) if video_stream else 720
+        duration = int(float(data["format"]["duration"]))
+        return width, height, duration
+    except Exception:
+        return 1280, 720, 0
+
+async def get_thumbnail(file_path):
+    try:
+        thumb_path = f"{file_path}_thumb.jpg"
+        cmd = ["ffmpeg", "-i", file_path, "-ss", "00:00:02.000", "-vframes", "1", thumb_path, "-y"]
+        process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        await process.communicate()
+        if os.path.exists(thumb_path):
+            return thumb_path
+    except Exception: pass
+    return None
+
 # ================= Bot Logic =================
 @app.on_message(filters.command("start") & filters.private)
 async def cmd_start(client, message):
     await safe_delete(message)
     msg = await message.reply_text("<blockquote>✨ <b>Transmit a Terabox Link</b> 🙌\n<i>Our servers will handle the rest.</i></blockquote>")
-    active_welcome_msgs[message.chat.id] = msg.id # Track message
+    active_welcome_msgs[message.chat.id] = msg.id 
     asyncio.create_task(delete_after(client, msg.chat.id, msg.id, TEMP_MSG_DELETE_TIME))
 
 @app.on_callback_query(filters.regex("terabox_start"))
 async def callback_download_more(client, callback_query):
     msg = await callback_query.message.reply_text("<blockquote>✨ <b>Transmit a Terabox Link</b> 🙌\n<i>Ready for the next payload.</i></blockquote>")
-    active_welcome_msgs[callback_query.message.chat.id] = msg.id # Track message
+    active_welcome_msgs[callback_query.message.chat.id] = msg.id 
     await callback_query.answer()
 
 @app.on_message(filters.text & filters.private & ~filters.command(["start"]))
@@ -134,7 +161,6 @@ async def process_terabox_link(client, message):
             caption=user_caption, 
             reply_markup=keyboard
         )
-        # Track the new button message just in case the user replies to it next time
         active_welcome_msgs[message.chat.id] = sent_vid.id
         asyncio.create_task(delete_after(client, message.chat.id, sent_vid.id, FILE_DELETE_TIME))
         return 
@@ -174,12 +200,20 @@ async def process_terabox_link(client, message):
         asyncio.create_task(delete_after(client, anim_msg.chat.id, anim_msg.id, TEMP_MSG_DELETE_TIME))
         return
 
+    # Force MP4 if it's a weird format to help Telegram's video player
+    file_ext = file_name.split('.')[-1].lower() if '.' in file_name else ''
+    all_video_extensions = ['mp4', 'mkv', 'webm', 'avi', 'mov', 'flv', 'mpg', 'mpeg', 'ts', 'm4v']
+    
+    if file_ext in all_video_extensions and file_ext not in ['mp4', 'mkv', 'webm', 'mov']:
+        file_name = file_name.rsplit('.', 1)[0] + ".mp4"
+        file_ext = "mp4"
+
     dur_parts = duration_str.split(":")
     dur_secs = 0
     if len(dur_parts) == 2: dur_secs = int(dur_parts[0]) * 60 + int(dur_parts[1])
     elif len(dur_parts) == 3: dur_secs = int(dur_parts[0]) * 3600 + int(dur_parts[1]) * 60 + int(dur_parts[2])
 
-    await anim_msg.edit_text("<blockquote><code>[📥] Downloading...</code></blockquote>")
+    await anim_msg.edit_text("<blockquote><code>[📥] Downloading Data Stream...</code></blockquote>")
     await client.send_chat_action(message.chat.id, enums.ChatAction.RECORD_VIDEO)
     
     os.makedirs("downloads", exist_ok=True)
@@ -187,17 +221,20 @@ async def process_terabox_link(client, message):
     thumb_path = f"downloads/thumb_{secrets.token_hex(4)}.jpg" if thumb_url else None
     
     try:
-        # Kept exactly as you had it
         dl_headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
         }
         
         async with aiohttp.ClientSession(timeout=timeout, headers=dl_headers) as session:
+            # Download thumbnail if API provided one
             if thumb_url:
-                async with session.get(thumb_url) as t_resp:
-                    if t_resp.status == 200:
-                        async with aiofiles.open(thumb_path, mode='wb') as f:
-                            await f.write(await t_resp.read())
+                try:
+                    async with session.get(thumb_url) as t_resp:
+                        if t_resp.status == 200:
+                            async with aiofiles.open(thumb_path, mode='wb') as f:
+                                await f.write(await t_resp.read())
+                except Exception:
+                    pass
             
             async with session.get(video_url) as resp:
                 if resp.status != 200:
@@ -207,35 +244,49 @@ async def process_terabox_link(client, message):
                 if 'text/html' in content_type:
                     raise Exception("Terabox returned a webpage instead of a video.")
 
+                # --- THE OOM FIX: 0-RAM Download Processing ---
                 async with aiofiles.open(local_filename, mode='wb') as f:
-                    while True:
-                        chunk = await resp.content.read(2 * 1024 * 1024) 
-                        if not chunk: break
+                    async for chunk in resp.content.iter_chunked(4 * 1024 * 1024): 
                         await f.write(chunk)
+                        del chunk 
+                
+                # --- THE 0-BYTE TRAP ---
+                if os.path.getsize(local_filename) == 0:
+                    raise Exception("Remote server returned 0 Bytes. The direct link has expired or blocked!")
+
     except Exception as e:
         await anim_msg.edit_text(f"<blockquote>❌ <b>Download Interrupted:</b>\n<code>{e}</code></blockquote>")
         asyncio.create_task(delete_after(client, anim_msg.chat.id, anim_msg.id, TEMP_MSG_DELETE_TIME))
+        if os.path.exists(local_filename): os.remove(local_filename)
         return
 
-    await anim_msg.edit_text("<blockquote><code>[📤] Uploading...</code></blockquote>")
+    # --- THE FFMPEG NUCLEAR OPTION ---
+    await anim_msg.edit_text("<blockquote><code>[⚙️] Processing Media Engine...</code></blockquote>")
+    
+    width, height, exact_dur = await get_video_info(local_filename)
+    final_dur = exact_dur if exact_dur > 0 else dur_secs
+
+    # If xAPIverse didn't give a thumbnail, rip one directly from the video using FFmpeg
+    if not thumb_path or not os.path.exists(thumb_path):
+        thumb_path = await get_thumbnail(local_filename)
+
+    await anim_msg.edit_text("<blockquote><code>[📤] Uploading Payload...</code></blockquote>")
     await client.send_chat_action(message.chat.id, enums.ChatAction.UPLOAD_VIDEO)
 
     link_id = secrets.token_urlsafe(8)
     fsb_link = f"https://t.me/{FILESHARE_BOT_USERNAME}?start={link_id}"
     channel_caption = f"🔗 **Access Link:**\n<code>{fsb_link}</code>"
 
-    # Smart File Router so you don't get the unsupported file error
-    file_ext = file_name.split('.')[-1].lower() if '.' in file_name else 'mp4'
-    video_extensions = ['mp4', 'mkv', 'webm', 'avi', 'mov', 'flv']
-
     try:
-        if file_ext in video_extensions:
+        if file_ext in all_video_extensions:
             saved_msg = await client.send_video(
                 chat_id=CHANNEL_ID, 
                 video=local_filename, 
                 caption=channel_caption, 
                 has_spoiler=True,
-                duration=dur_secs,
+                duration=final_dur,
+                width=width,
+                height=height,
                 thumb=thumb_path if thumb_path and os.path.exists(thumb_path) else None,
                 file_name=file_name,
                 supports_streaming=True
@@ -254,7 +305,7 @@ async def process_terabox_link(client, message):
 
         await anim_msg.edit_text("<blockquote><code>[✅] Complete</code></blockquote>")
         
-        icon = "🎬" if file_ext in video_extensions else "📄"
+        icon = "🎬" if file_ext in all_video_extensions else "📄"
         user_caption = (
             f"{icon} <b>{file_name}</b>\n\n"
             f"⏱ <b>Duration:</b> {duration_str}\n"
@@ -270,7 +321,6 @@ async def process_terabox_link(client, message):
             caption=user_caption, 
             reply_markup=keyboard
         )
-        # Track the new button message just in case the user replies to it next time
         active_welcome_msgs[message.chat.id] = sent_vid.id
         
         asyncio.create_task(delete_after(client, message.chat.id, sent_vid.id, FILE_DELETE_TIME))
@@ -285,4 +335,3 @@ async def process_terabox_link(client, message):
 if __name__ == "__main__":
     print("Starting Terabox Bot...")
     app.run()
-    
